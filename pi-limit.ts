@@ -7,19 +7,22 @@
  *   /limit cost 0.50      maximum cost in US$
  *   /limit time 30        maximum active time in minutes (only counts while the agent runs)
  *   /limit tokens 200000  output tokens (accepts 200k)
- *   /limit stop           disables it, clears the limits and restarts the budget
+ *   /limit reset          keeps the limits, zeroes the usage
+ *   /limit stop           disables it, clears the limits and the usage
  *   /limit                shows the current state
  *
- * Running /limit <axis> <value> again while limits are active restarts the budget (usage
- * reset to zero), so the same command doubles as "start this limit again".
+ * Running /limit <axis> <value> again only changes that limit; the usage already made is kept
+ * (raising it above the usage unblocks the session, lowering it below blocks it).
  *
  * The form with arguments also works when the client sends the text as a plain message
  * (T3, for example, only dispatches a command when the message is exactly the command name):
  * the `input` hook recognizes "/limit ..." and runs it without reaching the model.
  *
  * The budget starts counting when the first limit is set. On every turn the model receives a
- * [session-budget] note with what is left; when a limit is exhausted, new tool calls and new
- * prompts are blocked and the turn is aborted.
+ * [session-budget] note with what is left. When a limit is exhausted, new prompts and tool calls
+ * are blocked: crossed at the end of a response, the model gets one last turn for a summary;
+ * crossed mid-stream (or by the time limit), the turn is aborted at once. The state is saved in
+ * the session so /reload, resume and fork keep it.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -46,9 +49,20 @@ interface SessionBudget {
 	runningSince?: number;
 	cost: number;
 	outputTokens: number;
+	/** Estimated cost / output tokens of the message being streamed (not final yet). */
+	pendingCost: number;
+	pendingTokens: number;
 	/** Reason for the block, once a limit is exhausted. */
 	stopped?: string;
 }
+
+/** What survives /reload, resume and fork (stored as a custom session entry). */
+interface PersistedState {
+	limits: Limits;
+	budget?: { startedAt: number; activeMs: number; cost: number; outputTokens: number; stopped?: string };
+}
+
+const ENTRY_TYPE = "session-limit";
 
 interface LimitView {
 	cost?: { used: number; limit: number; left: number; over: boolean };
@@ -88,11 +102,12 @@ const HELP = [
 	"  /limit cost 0.50      maximum session cost (US$)",
 	"  /limit time 30        maximum session active time (minutes)",
 	"  /limit tokens 200000  session output tokens (accepts 200k)",
-	"  /limit stop           disables it, clears the limits and restarts the budget",
+	"  /limit reset          keeps the limits, zeroes the usage",
+	"  /limit stop           disables it, clears the limits and the usage",
 	"  /limit                shows the current state",
 	"",
 	"The budget is one per session and starts counting on the first /limit.",
-	"Running /limit with a value again restarts it (usage reset to zero).",
+	"Changing a limit keeps the usage already made; /limit reset zeroes it.",
 	"The extension starts disabled in every session.",
 ].join("\n");
 
@@ -154,7 +169,7 @@ function view(now = Date.now()): LimitView {
 	const result: LimitView = { over: [] };
 
 	if (limits.cost !== undefined) {
-		const used = budget?.cost ?? 0;
+		const used = (budget?.cost ?? 0) + (budget?.pendingCost ?? 0);
 		const left = limits.cost - used;
 		result.cost = { used, limit: limits.cost, left: Math.max(0, left), over: left <= 0 };
 	}
@@ -165,7 +180,7 @@ function view(now = Date.now()): LimitView {
 		result.time = { usedMs, limitMs, leftMs: Math.max(0, leftMs), over: leftMs <= 0 };
 	}
 	if (limits.tokens !== undefined) {
-		const used = budget?.outputTokens ?? 0;
+		const used = (budget?.outputTokens ?? 0) + (budget?.pendingTokens ?? 0);
 		const left = limits.tokens - used;
 		result.tokens = { used, limit: limits.tokens, left: Math.max(0, left), over: left <= 0 };
 	}
@@ -228,17 +243,19 @@ function syncClock(ctx?: ExtensionContext): void {
 	else pauseClock(ctx);
 }
 
+function newBudget(): SessionBudget {
+	return { startedAt: Date.now(), activeMs: 0, cost: 0, outputTokens: 0, pendingCost: 0, pendingTokens: 0 };
+}
+
 function ensureBudget(): SessionBudget {
-	if (!budget) {
-		budget = { startedAt: Date.now(), activeMs: 0, cost: 0, outputTokens: 0 };
-	}
+	if (!budget) budget = newBudget();
 	return budget;
 }
 
-/** Zero the accumulated usage and start counting now (new /limit with limits already set). */
+/** Zero the accumulated usage and start counting now (/limit reset). */
 function restartBudget(ctx?: ExtensionContext): void {
 	clearTimer();
-	budget = { startedAt: Date.now(), activeMs: 0, cost: 0, outputTokens: 0 };
+	budget = newBudget();
 	syncClock(ctx);
 	armTimer(ctx);
 	updateStatus(ctx);
@@ -252,13 +269,71 @@ function resetAll(): void {
 	delete limits.tokens;
 }
 
+// ---------------------------------------------------------------------------
+// Persistence (survives /reload, resume and fork)
+// ---------------------------------------------------------------------------
+
+let persist: ((state: PersistedState) => void) | undefined;
+
+function saveState(): void {
+	if (!persist) return;
+	const state: PersistedState = {
+		limits: { ...limits },
+		budget: budget
+			? {
+					startedAt: budget.startedAt,
+					activeMs: elapsedActiveMs(),
+					cost: budget.cost,
+					outputTokens: budget.outputTokens,
+					stopped: budget.stopped,
+				}
+			: undefined,
+	};
+	try {
+		persist(state);
+	} catch {
+		// Persistence is best-effort; the in-memory budget keeps working.
+	}
+}
+
+/** Restores the last saved state on the current branch; no entry means a fresh, disabled session. */
+function restoreState(ctx: ExtensionContext): void {
+	resetAll();
+	let saved: PersistedState | undefined;
+	try {
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type === "custom" && entry.customType === ENTRY_TYPE) saved = entry.data as PersistedState;
+		}
+	} catch {
+		// No session manager available: start disabled.
+	}
+	if (!saved?.limits) return;
+
+	for (const axis of ["cost", "time", "tokens"] as const) {
+		const value = saved.limits[axis];
+		if (typeof value === "number" && Number.isFinite(value) && value > 0) limits[axis] = value;
+	}
+	if (!enabled()) return;
+
+	budget = newBudget();
+	if (saved.budget) {
+		budget.startedAt = saved.budget.startedAt ?? budget.startedAt;
+		budget.activeMs = saved.budget.activeMs ?? 0;
+		budget.cost = saved.budget.cost ?? 0;
+		budget.outputTokens = saved.budget.outputTokens ?? 0;
+		budget.stopped = saved.budget.stopped;
+	}
+	syncClock(ctx);
+	armTimer(ctx);
+}
+
 function updateStatus(ctx: ExtensionContext | undefined): void {
 	if (!ctx) return;
 	let text: string | undefined;
 
 	if (enabled() && budget) {
 		if (budget.stopped) {
-			text = `⚖ session limit: STOPPED (${budget.stopped})`;
+			text = `session limit: STOPPED (${budget.stopped})`;
 		} else {
 			const current = view();
 			const parts: string[] = [];
@@ -267,7 +342,7 @@ function updateStatus(ctx: ExtensionContext | undefined): void {
 			if (current.tokens) {
 				parts.push(`${compactTokens(current.tokens.used)}/${compactTokens(current.tokens.limit)} tok`);
 			}
-			text = `⚖ ${parts.join(" · ")}`;
+			text = parts.join(" · ");
 		}
 	}
 
@@ -316,7 +391,13 @@ function stopIfNeeded(ctx: ExtensionContext | undefined, abort: boolean): boolea
 /** Unblocks the session when the limits were raised above the usage already made. */
 function releaseIfRecovered(ctx?: ExtensionContext): boolean {
 	if (!budget?.stopped || !enabled()) return false;
-	if (view().over.length > 0) return false;
+	const over = view().over;
+	if (over.length > 0) {
+		// Still blocked, possibly by a different axis than before.
+		budget.stopped = over.map((axis) => AXIS_LABEL[axis]).join(" + ");
+		updateStatus(ctx);
+		return false;
+	}
 
 	budget.stopped = undefined;
 	armTimer(ctx);
@@ -374,11 +455,20 @@ interface UsageLike {
 	cost?: { total?: number };
 }
 
-function costOfUsage(usage: UsageLike, ctx: ExtensionContext): number {
+function costOfUsage(usage: UsageLike, ctx: ExtensionContext, source?: { provider?: string; model?: string }): number {
 	const reported = usage.cost?.total;
 	if (typeof reported === "number" && Number.isFinite(reported) && reported > 0) return reported;
 
-	const rates = ctx.model?.cost;
+	// Rates of the model that produced the message, not the one selected right now.
+	let producer: { cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } } | undefined;
+	if (source?.provider && source.model) {
+		try {
+			producer = ctx.modelRegistry.find(source.provider, source.model);
+		} catch {
+			producer = undefined;
+		}
+	}
+	const rates = producer?.cost ?? ctx.model?.cost;
 	if (!rates) return 0;
 
 	const estimated =
@@ -394,12 +484,20 @@ function costOfUsage(usage: UsageLike, ctx: ExtensionContext): number {
 // /limit command
 // ---------------------------------------------------------------------------
 
-function parseAmountForAxis(axis: Axis, raw: string): number | undefined {
-	let text = raw.trim().toLowerCase().replace(",", ".");
+export function parseAmountForAxis(axis: Axis, raw: string): number | undefined {
+	let text = raw.trim().toLowerCase();
 
 	if (axis === "time") text = text.replace(/\s*(min|mins|minute|minutes)$/, "");
 	if (axis === "tokens") text = text.replace(/\s*(tokens?|tok|tk)$/, "");
 	if (axis === "cost") text = text.replace(/^(us\$|\$)/, "").replace(/\s*(usd|dollars?)$/, "");
+
+	// Tokens are whole numbers, so "200,000" / "200.000" / "200_000" are thousands separators.
+	// Everything else treats a comma as the decimal separator ("0,50", "1,5k").
+	if (axis === "tokens" && /^\d{1,3}(?:[.,_]\d{3})+$/.test(text)) {
+		text = text.replace(/[.,_]/g, "");
+	} else {
+		text = text.replace(",", ".");
+	}
 
 	const match = /^([0-9]+(?:\.[0-9]+)?)([km])?$/.exec(text);
 	if (!match) return undefined;
@@ -470,7 +568,7 @@ function statusReport(): string {
 				: `Session budget counting since ${started}.`,
 		);
 	}
-	lines.push("Use /limit stop to disable it and restart the budget.");
+	lines.push("Use /limit reset to zero the usage, or /limit stop to disable it.");
 	return lines.join("\n");
 }
 
@@ -502,6 +600,16 @@ async function handleLimitCommand(args: string, ctx: ExtensionContext): Promise<
 		return;
 	}
 
+	if (axisRaw === "reset" || axisRaw === "restart") {
+		if (!enabled()) {
+			notice(ctx, "No active limits. Set one first, e.g. /limit cost 0.50", "info");
+			return;
+		}
+		restartBudget(ctx);
+		notice(ctx, `Session budget restarted (usage reset to zero).\nActive: ${activeSummary()}.`, "info");
+		return;
+	}
+
 	if (axisRaw === "help" || axisRaw === "?" || axisRaw === "--help") {
 		notice(ctx, HELP, "info");
 		return;
@@ -525,7 +633,7 @@ async function handleLimitCommand(args: string, ctx: ExtensionContext): Promise<
 		return;
 	}
 
-	if (/^(off|none|clear|0)$/i.test(valueRaw)) {
+	if (/^(off|none|clear|0+(?:[.,]0+)?)$/i.test(valueRaw)) {
 		delete limits[axis];
 		if (!enabled()) {
 			resetAll();
@@ -547,28 +655,32 @@ async function handleLimitCommand(args: string, ctx: ExtensionContext): Promise<
 		return;
 	}
 
-	// Running /limit again while limits are active restarts the session budget.
+	// Changing a limit never touches the usage already made: use /limit reset for that.
 	const alreadyEnabled = enabled();
 	limits[axis] = amount;
 
-	if (alreadyEnabled) {
-		restartBudget(ctx);
-	} else {
-		ensureBudget();
-		syncClock(ctx);
-		armTimer(ctx);
-	}
+	ensureBudget();
+	syncClock(ctx);
+	armTimer(ctx); // the time limit may have changed
+	const released = releaseIfRecovered(ctx);
+	// A limit lowered below the usage already made blocks the session right away.
+	const blocked = stopIfNeeded(ctx, false);
 	updateStatus(ctx);
 
 	const running = budget ? budget.runningSince !== undefined : false;
 	const scopeNote = alreadyEnabled
-		? "Session budget restarted (usage reset)."
+		? "Usage kept (use /limit reset to zero it)."
 		: running
 			? "Applied to the running session."
 			: "Effective from now.";
+	const stateNote = released
+		? "\nSession budget unblocked."
+		: blocked
+			? `\nSession still blocked (${budget?.stopped}): usage is already over the limit.`
+			: "";
 	notice(
 		ctx,
-		`${AXIS_LABEL[axis]} limit set: ${formatLimit(axis, amount)} per session.\nActive: ${activeSummary()}. ${scopeNote}`,
+		`${AXIS_LABEL[axis]} limit set: ${formatLimit(axis, amount)} per session.\nActive: ${activeSummary()}. ${scopeNote}${stateNote}`,
 		"info",
 	);
 }
@@ -578,16 +690,20 @@ async function handleLimitCommand(args: string, ctx: ExtensionContext): Promise<
 // ---------------------------------------------------------------------------
 
 export default function sessionLimit(pi: ExtensionAPI) {
-	// Every session starts with no limits: the extension only turns on through /limit.
+	persist = (state) => pi.appendEntry(ENTRY_TYPE, state);
+
+	// A brand-new session starts with no limits (nothing saved). Reload, resume and fork restore
+	// the state saved on the current branch, so /reload does not silently switch the budget off.
 	pi.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
-		resetAll();
 		warnedMissingCost = false;
+		restoreState(ctx);
 		updateStatus(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
 		clearTimer();
+		saveState();
 	});
 
 	// Active time: only counts while the agent is working.
@@ -601,6 +717,7 @@ export default function sessionLimit(pi: ExtensionAPI) {
 		lastCtx = ctx;
 		pauseClock(ctx);
 		updateStatus(ctx);
+		if (enabled()) saveState();
 	});
 
 	// Budget note appended to the end of every request (one per turn, never persisted).
@@ -622,6 +739,36 @@ export default function sessionLimit(pi: ExtensionAPI) {
 		};
 	});
 
+	// While a response streams, watch an estimate of its cost/tokens so a long answer cannot
+	// run far past the limit before message_end. Estimates are dropped at message_end.
+	pi.on("message_update", async (event, ctx) => {
+		lastCtx = ctx;
+		if (!budget || !enabled() || budget.stopped) return;
+		if (limits.cost === undefined && limits.tokens === undefined) return;
+
+		const partial = event.message as unknown as {
+			role?: string;
+			provider?: string;
+			model?: string;
+			usage?: UsageLike;
+			content?: Array<{ type?: string; text?: string; thinking?: string; arguments?: unknown }>;
+		};
+		if (partial.role !== "assistant") return;
+
+		let chars = 0;
+		for (const block of partial.content ?? []) {
+			if (block.type === "text") chars += block.text?.length ?? 0;
+			else if (block.type === "thinking") chars += block.thinking?.length ?? 0;
+			else if (block.type === "toolCall") chars += JSON.stringify(block.arguments ?? {}).length;
+		}
+		// ~4 characters per token: rough, so it is only a floor next to what the provider reports.
+		const output = Math.max(partial.usage?.output ?? 0, Math.ceil(chars / 4));
+		budget.pendingTokens = output;
+		budget.pendingCost = costOfUsage({ ...partial.usage, output }, ctx, partial);
+
+		stopIfNeeded(ctx, true);
+	});
+
 	// Accounts the cost and output tokens of every finalized message.
 	pi.on("message_end", async (event, ctx) => {
 		lastCtx = ctx;
@@ -629,14 +776,25 @@ export default function sessionLimit(pi: ExtensionAPI) {
 
 		const message = event.message as unknown as {
 			role?: string;
+			provider?: string;
+			model?: string;
 			usage?: UsageLike;
 			content?: Array<{ type?: string }>;
 		};
-		const usage = message.usage;
+		const pendingTokens = budget.pendingTokens;
+		budget.pendingCost = 0;
+		budget.pendingTokens = 0;
+
+		let usage = message.usage;
 		if (!usage) return;
 		if (message.role !== "assistant" && message.role !== "toolResult") return;
+		// An aborted stream may report no usage; fall back to what was streamed.
+		if (message.role === "assistant" && (usage.output ?? 0) === 0 && pendingTokens > 0) {
+			usage = { ...usage, output: pendingTokens };
+		}
 
-		const cost = costOfUsage(usage, ctx);
+		const wasStopped = budget.stopped !== undefined;
+		const cost = costOfUsage(usage, ctx, message);
 		if (
 			message.role === "assistant" &&
 			limits.cost !== undefined &&
@@ -657,7 +815,9 @@ export default function sessionLimit(pi: ExtensionAPI) {
 			Array.isArray(message.content) &&
 			message.content.some((block) => block?.type === "toolCall");
 
-		stopIfNeeded(ctx, wantsMoreTools);
+		// First time the limit is crossed at the end of a message: block tools but let the model
+		// write one last summary turn. If it still asks for tools after that, abort.
+		stopIfNeeded(ctx, wasStopped && wantsMoreTools);
 	});
 
 	// With the budget exhausted no tool runs anymore.
@@ -668,9 +828,10 @@ export default function sessionLimit(pi: ExtensionAPI) {
 		if (!budget.stopped) stopIfNeeded(ctx, false);
 		if (!budget.stopped) return;
 
+		// No `terminate`: that would end the turn before the model reads the reason and writes
+		// its final summary.
 		return {
 			block: true,
-			terminate: true,
 			reason: `[session-budget] Session budget exhausted (${budget.stopped}). Do not call tools. Reply with a short summary of what is done and what remains, then stop.`,
 		};
 	});
@@ -686,6 +847,7 @@ export default function sessionLimit(pi: ExtensionAPI) {
 		const commandArgs = matchLimitCommand(event.text);
 		if (commandArgs !== undefined) {
 			await handleLimitCommand(commandArgs, ctx);
+			saveState();
 			return { action: "handled" as const };
 		}
 
@@ -710,7 +872,8 @@ export default function sessionLimit(pi: ExtensionAPI) {
 				{ value: "time ", label: "time", description: "maximum session active time in minutes" },
 				{ value: "tokens ", label: "tokens", description: "session output tokens" },
 				{ value: "status", label: "status", description: "shows the current limits" },
-				{ value: "stop", label: "stop", description: "disables it and restarts the budget" },
+				{ value: "reset", label: "reset", description: "keeps the limits, zeroes the usage" },
+				{ value: "stop", label: "stop", description: "disables it and clears the usage" },
 			];
 			const query = prefix.trim().toLowerCase();
 			const matches = items.filter((item) => item.label.startsWith(query));
@@ -718,6 +881,7 @@ export default function sessionLimit(pi: ExtensionAPI) {
 		},
 		handler: async (args, ctx) => {
 			await handleLimitCommand(args, ctx);
+			saveState();
 		},
 	});
 }
