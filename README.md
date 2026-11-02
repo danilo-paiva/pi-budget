@@ -3,6 +3,8 @@
 A session budget for [pi](https://github.com/earendil-works/pi): cap **cost**, **active time** and
 **output tokens**, and stop the session when the budget runs out. Off until you run `/limit`.
 
+Shown in pi's footer (status bar), as usage / limit for each axis (cost · active time · output tokens):
+
 ```
 $0.1200/$0.5000 · 3.0 min/30.0 min · 12.5k/200.0k tok
 ```
