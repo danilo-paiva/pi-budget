@@ -7,15 +7,30 @@ The extension is **disabled by default** and only turns on through the `/limit` 
 
 ## Install
 
-Copy `pi-limit.ts` into your pi extensions directory and start (or reload) pi:
+This repo is a [pi package](https://pi.dev/packages), so install it with `pi install`:
 
+```sh
+pi install git:github.com/danilo-paiva/pi-limit
 ```
-~/.pi/agent/extensions/pi-limit.ts
+
+Then start pi, or run `/reload` in a running session. Useful commands:
+
+```sh
+pi list                                          # installed packages
+pi update git:github.com/danilo-paiva/pi-limit   # update to the latest commit
+pi remove git:github.com/danilo-paiva/pi-limit   # uninstall
+pi install -l git:github.com/danilo-paiva/pi-limit   # project-only (.pi/settings.json)
 ```
 
-Or load it for a single run: `pi --extension ./pi-limit.ts`
+Pin a version with a tag or commit: `pi install git:github.com/danilo-paiva/pi-limit@<ref>`.
 
-Personal extensions are picked up automatically; `/reload` reloads them in a running session.
+To try it for a single run without installing: `pi -e git:github.com/danilo-paiva/pi-limit`.
+
+### Manual install
+
+Copy `pi-limit.ts` into `~/.pi/agent/extensions/` (picked up automatically; `/reload` reloads it)
+or load a local copy with `pi --extension ./pi-limit.ts`. Do not combine this with `pi install`:
+the extension would be loaded twice.
 
 ## Usage
 
