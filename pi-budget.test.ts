@@ -1,7 +1,7 @@
-// Run with: node --test pi-limit.test.ts   (Node 22.18+ strips TypeScript types natively)
+// Run with: node --test pi-budget.test.ts   (Node 22.18+ strips TypeScript types natively)
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseAmountForAxis } from "./pi-limit.ts";
+import { parseAmountForAxis } from "./pi-budget.ts";
 
 test("tokens: thousands separators", () => {
 	for (const raw of ["200,000", "200.000", "200_000", "200000", "200k", "200000 tokens"]) {

@@ -8,10 +8,10 @@
     "url": "git+https://github.com/danilo-paiva/pi-budget.git"
   },
   "scripts": {
-    "test": "node --test pi-limit.test.ts"
+    "test": "node --test pi-budget.test.ts"
   },
   "pi": {
-    "extensions": ["./pi-limit.ts"]
+    "extensions": ["./pi-budget.ts"]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

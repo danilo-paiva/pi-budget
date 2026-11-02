@@ -1,22 +1,22 @@
 /**
- * Session Limit - session-wide budget on three axes: cost, active time and output tokens.
+ * Session Budget - session-wide budget on three axes: cost, active time and output tokens.
  *
- * The extension is OFF by default. Limits are set with /limit and apply to the whole session
- * (every prompt and automatic turn, until /limit stop or a new session):
+ * The extension is OFF by default. Limits are set with /budget and apply to the whole session
+ * (every prompt and automatic turn, until /budget stop or a new session):
  *
- *   /limit cost 0.50      maximum cost in US$
- *   /limit time 30        maximum active time in minutes (only counts while the agent runs)
- *   /limit tokens 200000  output tokens (accepts 200k)
- *   /limit reset          keeps the limits, zeroes the usage
- *   /limit stop           disables it, clears the limits and the usage
- *   /limit                shows the current state
+ *   /budget cost 0.50      maximum cost in US$
+ *   /budget time 30        maximum active time in minutes (only counts while the agent runs)
+ *   /budget tokens 200000  output tokens (accepts 200k)
+ *   /budget reset          keeps the limits, zeroes the usage
+ *   /budget stop           disables it, clears the limits and the usage
+ *   /budget                shows the current state
  *
- * Running /limit <axis> <value> again only changes that limit; the usage already made is kept
+ * Running /budget <axis> <value> again only changes that limit; the usage already made is kept
  * (raising it above the usage unblocks the session, lowering it below blocks it).
  *
  * The form with arguments also works when the client sends the text as a plain message
  * (T3, for example, only dispatches a command when the message is exactly the command name):
- * the `input` hook recognizes "/limit ..." and runs it without reaching the model.
+ * the `input` hook recognizes "/budget ..." and runs it without reaching the model.
  *
  * The budget starts counting when the first limit is set. On every turn the model receives a
  * [session-budget] note with what is left. When a limit is exhausted, new prompts and tool calls
@@ -78,9 +78,9 @@ const AXIS_LABEL: Record<Axis, string> = {
 };
 
 const AXIS_HINT: Record<Axis, string> = {
-	cost: "Use /limit cost 0.50",
-	time: "Use /limit time 30",
-	tokens: "Use /limit tokens 200000",
+	cost: "Use /budget cost 0.50",
+	time: "Use /budget time 30",
+	tokens: "Use /budget tokens 200000",
 };
 
 const AXIS_ALIASES: Record<string, Axis> = {
@@ -97,17 +97,17 @@ const AXIS_ALIASES: Record<string, Axis> = {
 };
 
 const HELP = [
-	"Usage: /limit <option> [value]",
+	"Usage: /budget <option> [value]",
 	"",
-	"  /limit cost 0.50      maximum session cost (US$)",
-	"  /limit time 30        maximum session active time (minutes)",
-	"  /limit tokens 200000  session output tokens (accepts 200k)",
-	"  /limit reset          keeps the limits, zeroes the usage",
-	"  /limit stop           disables it, clears the limits and the usage",
-	"  /limit                shows the current state",
+	"  /budget cost 0.50      maximum session cost (US$)",
+	"  /budget time 30        maximum session active time (minutes)",
+	"  /budget tokens 200000  session output tokens (accepts 200k)",
+	"  /budget reset          keeps the limits, zeroes the usage",
+	"  /budget stop           disables it, clears the limits and the usage",
+	"  /budget                shows the current state",
 	"",
-	"The budget is one per session and starts counting on the first /limit.",
-	"Changing a limit keeps the usage already made; /limit reset zeroes it.",
+	"The budget is one per session and starts counting on the first /budget.",
+	"Changing a limit keeps the usage already made; /budget reset zeroes it.",
 	"The extension starts disabled in every session.",
 ].join("\n");
 
@@ -252,7 +252,7 @@ function ensureBudget(): SessionBudget {
 	return budget;
 }
 
-/** Zero the accumulated usage and start counting now (/limit reset). */
+/** Zero the accumulated usage and start counting now (/budget reset). */
 function restartBudget(ctx?: ExtensionContext): void {
 	clearTimer();
 	budget = newBudget();
@@ -481,7 +481,7 @@ function costOfUsage(usage: UsageLike, ctx: ExtensionContext, source?: { provide
 }
 
 // ---------------------------------------------------------------------------
-// /limit command
+// /budget command
 // ---------------------------------------------------------------------------
 
 export function parseAmountForAxis(axis: Axis, raw: string): number | undefined {
@@ -517,10 +517,10 @@ function statusReport(): string {
 		lines.push("");
 		lines.push("No limits set.");
 		lines.push("");
-		lines.push("  /limit cost 0.50");
-		lines.push("  /limit time 30");
-		lines.push("  /limit tokens 200000");
-		lines.push("  /limit stop");
+		lines.push("  /budget cost 0.50");
+		lines.push("  /budget time 30");
+		lines.push("  /budget tokens 200000");
+		lines.push("  /budget stop");
 		return lines.join("\n");
 	}
 
@@ -556,7 +556,7 @@ function statusReport(): string {
 
 	lines.push("");
 	if (!budget) {
-		lines.push("The budget starts counting on the first /limit.");
+		lines.push("The budget starts counting on the first /budget.");
 	} else {
 		const started = new Date(budget.startedAt).toLocaleTimeString("en-US", {
 			hour: "2-digit",
@@ -568,20 +568,20 @@ function statusReport(): string {
 				: `Session budget counting since ${started}.`,
 		);
 	}
-	lines.push("Use /limit reset to zero the usage, or /limit stop to disable it.");
+	lines.push("Use /budget reset to zero the usage, or /budget stop to disable it.");
 	return lines.join("\n");
 }
 
 /**
- * Recognizes "/limit ..." sent as a plain message. Clients such as T3 only dispatch a command
+ * Recognizes "/budget ..." sent as a plain message. Clients such as T3 only dispatch a command
  * when the text is exactly the name, so the form with arguments arrives as a prompt.
  */
-function matchLimitCommand(text: string): string | undefined {
-	const match = /^\/limit(?:\s+([\s\S]*))?$/i.exec(text.trim());
+function matchBudgetCommand(text: string): string | undefined {
+	const match = /^\/budget(?:\s+([\s\S]*))?$/i.exec(text.trim());
 	return match ? (match[1] ?? "").trim() : undefined;
 }
 
-async function handleLimitCommand(args: string, ctx: ExtensionContext): Promise<void> {
+async function handleBudgetCommand(args: string, ctx: ExtensionContext): Promise<void> {
 	lastCtx = ctx;
 	const normalized = args.trim();
 	const [rawAxis, ...rest] = normalized.split(/\s+/);
@@ -596,13 +596,13 @@ async function handleLimitCommand(args: string, ctx: ExtensionContext): Promise<
 	if (axisRaw === "stop" || axisRaw === "off" || axisRaw === "disable") {
 		resetAll();
 		updateStatus(ctx);
-		notice(ctx, "Session limits disabled. The budget restarts on the next /limit.", "info");
+		notice(ctx, "Session limits disabled. The budget restarts on the next /budget.", "info");
 		return;
 	}
 
 	if (axisRaw === "reset" || axisRaw === "restart") {
 		if (!enabled()) {
-			notice(ctx, "No active limits. Set one first, e.g. /limit cost 0.50", "info");
+			notice(ctx, "No active limits. Set one first, e.g. /budget cost 0.50", "info");
 			return;
 		}
 		restartBudget(ctx);
@@ -655,7 +655,7 @@ async function handleLimitCommand(args: string, ctx: ExtensionContext): Promise<
 		return;
 	}
 
-	// Changing a limit never touches the usage already made: use /limit reset for that.
+	// Changing a limit never touches the usage already made: use /budget reset for that.
 	const alreadyEnabled = enabled();
 	limits[axis] = amount;
 
@@ -669,7 +669,7 @@ async function handleLimitCommand(args: string, ctx: ExtensionContext): Promise<
 
 	const running = budget ? budget.runningSince !== undefined : false;
 	const scopeNote = alreadyEnabled
-		? "Usage kept (use /limit reset to zero it)."
+		? "Usage kept (use /budget reset to zero it)."
 		: running
 			? "Applied to the running session."
 			: "Effective from now.";
@@ -837,16 +837,16 @@ export default function sessionLimit(pi: ExtensionAPI) {
 	});
 
 	// Two roles:
-	// 1) accept "/limit ..." typed as a plain message - clients such as T3 only dispatch a
-	//    command when the message is exactly the name, so "/limit time 1" would become a prompt;
+	// 1) accept "/budget ..." typed as a plain message - clients such as T3 only dispatch a
+	//    command when the message is exactly the name, so "/budget time 1" would become a prompt;
 	// 2) block prompts once the session budget is exhausted.
 	pi.on("input", async (event, ctx) => {
 		lastCtx = ctx;
 		if (event.source === "extension") return { action: "continue" as const };
 
-		const commandArgs = matchLimitCommand(event.text);
+		const commandArgs = matchBudgetCommand(event.text);
 		if (commandArgs !== undefined) {
-			await handleLimitCommand(commandArgs, ctx);
+			await handleBudgetCommand(commandArgs, ctx);
 			saveState();
 			return { action: "handled" as const };
 		}
@@ -858,13 +858,13 @@ export default function sessionLimit(pi: ExtensionAPI) {
 
 		notice(
 			ctx,
-			`Session budget exhausted (${budget.stopped}). Raise a limit with /limit or disable it with /limit stop.`,
+			`Session budget exhausted (${budget.stopped}). Raise a limit with /budget or disable it with /budget stop.`,
 			"warning",
 		);
 		return { action: "handled" as const };
 	});
 
-	pi.registerCommand("limit", {
+	pi.registerCommand("budget", {
 		description: "Limit session cost, active time and output tokens (off by default)",
 		getArgumentCompletions: (prefix) => {
 			const items = [
@@ -880,7 +880,7 @@ export default function sessionLimit(pi: ExtensionAPI) {
 			return matches.length > 0 ? matches : items;
 		},
 		handler: async (args, ctx) => {
-			await handleLimitCommand(args, ctx);
+			await handleBudgetCommand(args, ctx);
 			saveState();
 		},
 	});

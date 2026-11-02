@@ -2,7 +2,7 @@
 
 An extension for [pi](https://github.com/earendil-works/pi) that makes agents budget-aware.
 It caps **cost**, **active time** and **output tokens**, and stops the session when the budget runs out.
-Off until you run `/limit`.
+Off until you run `/budget`.
 
 Shown in pi's footer (status bar), as usage / limit per axis:
 
@@ -21,16 +21,16 @@ Then start pi or run `/reload`. Update and remove with `pi update` / `pi remove`
 ## Usage
 
 ```
-/limit cost 0.50       # max cost, US$
-/limit time 30         # max active time, minutes
-/limit tokens 200k     # max output tokens (200000, 200,000 and 200.000 also work)
-/limit                 # show limits, usage and what is left
-/limit <axis> off      # remove one limit
-/limit reset           # keep the limits, zero the usage
-/limit stop            # disable everything
+/budget cost 0.50       # max cost, US$
+/budget time 30         # max active time, minutes
+/budget tokens 200k     # max output tokens (200000, 200,000 and 200.000 also work)
+/budget                 # show limits, usage and what is left
+/budget <axis> off      # remove one limit
+/budget reset           # keep the limits, zero the usage
+/budget stop            # disable everything
 ```
 
-- One budget per session, counting from the first `/limit`. Changing a limit keeps the usage.
+- One budget per session, counting from the first `/budget`. Changing a limit keeps the usage.
 - Limits and usage are saved in the session (`/reload`, resume and fork keep them). A new session
   starts with no limits.
 - The model gets a `[session-budget]` note on every request with what is left.
@@ -47,5 +47,5 @@ the cost limit cannot count it.
 ## Development
 
 ```sh
-npm test    # node --test pi-limit.test.ts (Node 22.18+)
+npm test    # node --test pi-budget.test.ts (Node 22.18+)
 ```
