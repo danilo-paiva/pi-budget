@@ -1,4 +1,4 @@
-# pi-limit
+# pi-budget
 
 An extension for [pi](https://github.com/earendil-works/pi) that makes agents budget-aware.
 It caps **cost**, **active time** and **output tokens**, and stops the session when the budget runs out.
@@ -13,7 +13,7 @@ $0.1200/$0.5000 · 3.0 min/30.0 min · 12.5k/200.0k tok
 ## Install
 
 ```sh
-pi install git:github.com/danilo-paiva/pi-limit
+pi install git:github.com/danilo-paiva/pi-budget
 ```
 
 Then start pi or run `/reload`. Update and remove with `pi update` / `pi remove` on the same source.

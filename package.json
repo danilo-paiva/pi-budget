@@ -1,11 +1,11 @@
 {
-  "name": "pi-limit",
+  "name": "pi-budget",
   "version": "0.1.0",
   "description": "Session-wide cost, active time and output-token budget for pi",
   "keywords": ["pi-package", "pi-extension"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/danilo-paiva/pi-limit.git"
+    "url": "git+https://github.com/danilo-paiva/pi-budget.git"
   },
   "scripts": {
     "test": "node --test pi-limit.test.ts"
