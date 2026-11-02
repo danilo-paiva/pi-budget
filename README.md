@@ -2,9 +2,9 @@
 
 An extension for [pi](https://github.com/earendil-works/pi) that makes agents budget-aware.
 It caps **cost**, **active time** and **output tokens**, and stops the session when the budget runs out.
-Off by default until you run `/limit`.
+Off until you run `/limit`.
 
-Shown in pi's footer (status bar), as usage / limit for each axis (cost · active time · output tokens):
+Shown in pi's footer (status bar), as usage / limit per axis:
 
 ```
 $0.1200/$0.5000 · 3.0 min/30.0 min · 12.5k/200.0k tok
