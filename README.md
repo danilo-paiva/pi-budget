@@ -1,6 +1,6 @@
 # pi-limit
 
-A session budget for [pi](https://github.com/earendil-works/pi) that makes agent budget-aware. It caps **cost**, **active time** and
+An extension for [pi](https://github.com/earendil-works/pi) that makes agent budget-aware. It caps **cost**, **active time** and
 **output tokens**, and stops the session when the budget runs out. Off by default until you run `/limit`.
 
 Shown in pi's footer (status bar), as usage / limit for each axis (cost · active time · output tokens):
