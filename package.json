@@ -1,7 +1,7 @@
 {
   "name": "pi-budget",
-  "version": "0.1.0",
-  "description": "Session-wide cost, active time and output-token budget for pi",
+  "version": "0.2.0",
+  "description": "Cost, active time and output-token budget for pi, per session or per prompt",
   "keywords": ["pi-package", "pi-extension"],
   "repository": {
     "type": "git",

@@ -1,18 +1,22 @@
 /**
- * Session Budget - session-wide budget on three axes: cost, active time and output tokens.
+ * Session Budget - budget on three axes (cost, active time and output tokens), counted over the
+ * whole session or from the start of each prompt.
  *
- * The extension is OFF by default. Limits are set with /budget and apply to the whole session
+ * The extension is OFF by default. Limits are set with /budget and apply to the scope in use
  * (every prompt and automatic turn, until /budget stop or a new session):
  *
  *   /budget cost 0.50      maximum cost in US$
  *   /budget time 30        maximum active time in minutes (only counts while the agent runs)
  *   /budget tokens 200000  output tokens (accepts 200k)
+ *   /budget prompt         scope: the usage restarts on every new prompt
+ *   /budget session        scope: the usage accumulates over the session (default)
  *   /budget reset          keeps the limits, zeroes the usage
- *   /budget stop           disables it, clears the limits and the usage
+ *   /budget stop           disables it, clears the limits, the usage and the scope
  *   /budget                shows the current state
  *
  * Running /budget <axis> <value> again only changes that limit; the usage already made is kept
- * (raising it above the usage unblocks the session, lowering it below blocks it).
+ * (raising it above the usage unblocks the session, lowering it below blocks it). Changing the
+ * scope zeroes the usage, because the counter means something different in each scope.
  *
  * The form with arguments also works when the client sends the text as a plain message
  * (T3, for example, only dispatches a command when the message is exactly the command name):
@@ -21,8 +25,9 @@
  * The budget starts counting when the first limit is set. On every turn the model receives a
  * [session-budget] note with what is left. When a limit is exhausted, new prompts and tool calls
  * are blocked: crossed at the end of a response, the model gets one last turn for a summary;
- * crossed mid-stream (or by the time limit), the turn is aborted at once. The state is saved in
- * the session so /reload, resume and fork keep it.
+ * crossed mid-stream (or by the time limit), the turn is aborted at once. In the per-prompt
+ * scope a new prompt opens a fresh window. The state is saved in the session so /reload, resume
+ * and fork keep it.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -30,6 +35,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 const STATUS_KEY = "session-limit";
 
 type Axis = "cost" | "time" | "tokens";
+
+/** How the usage is counted: from the session start (default) or from the start of each prompt. */
+export type Scope = "session" | "prompt";
 
 interface Limits {
 	/** US$ per session. */
@@ -59,6 +67,7 @@ interface SessionBudget {
 /** What survives /reload, resume and fork (stored as a custom session entry). */
 interface PersistedState {
 	limits: Limits;
+	scope?: Scope;
 	budget?: { startedAt: number; activeMs: number; cost: number; outputTokens: number; stopped?: string };
 }
 
@@ -96,22 +105,54 @@ const AXIS_ALIASES: Record<string, Axis> = {
 	output: "tokens",
 };
 
+/** /budget prompt and /budget session, the two scopes. */
+const SCOPE_ALIASES: Record<string, Scope> = {
+	prompt: "prompt",
+	"per-prompt": "prompt",
+	session: "session",
+	"per-session": "session",
+};
+
+export function parseScopeArgument(raw: string): Scope | undefined {
+	return SCOPE_ALIASES[raw.trim().toLowerCase().replace(/[\s_]+/g, "-")];
+}
+
+/** Footer suffix: only the non-default scope is worth the pixels. */
+function scopeTag(): string {
+	return scope === "prompt" ? " · per prompt" : "";
+}
+
+function scopeNoun(): string {
+	return scope === "prompt" ? "prompt" : "session";
+}
+
+function scopeSentence(): string {
+	return scope === "prompt"
+		? "per prompt (the usage restarts on every new prompt)"
+		: "per session (the usage accumulates until /budget reset)";
+}
+
 const HELP = [
 	"Usage: /budget <option> [value]",
 	"",
-	"  /budget cost 0.50      maximum session cost (US$)",
-	"  /budget time 30        maximum session active time (minutes)",
-	"  /budget tokens 200000  session output tokens (accepts 200k)",
+	"  /budget cost 0.50      maximum cost (US$)",
+	"  /budget time 30        maximum active time (minutes)",
+	"  /budget tokens 200000  output tokens (accepts 200k)",
+	"  /budget prompt         scope: limits apply to each prompt, usage restarts",
+	"  /budget session        scope: limits apply to the whole session",
 	"  /budget reset          keeps the limits, zeroes the usage",
-	"  /budget stop           disables it, clears the limits and the usage",
+	"  /budget stop           disables it, clears limits, usage and scope",
 	"  /budget                shows the current state",
 	"",
 	"The budget is one per session and starts counting on the first /budget.",
-	"Changing a limit keeps the usage already made; /budget reset zeroes it.",
+	"Changing a limit keeps the usage; /budget reset zeroes it.",
+	"Changing the scope zeroes the usage: the counter means something different in each scope.",
 	"The extension starts disabled in every session.",
 ].join("\n");
 
 const limits: Limits = {};
+/** Counted over the whole session (default) or from the start of each prompt. */
+let scope: Scope = "session";
 let budget: SessionBudget | undefined;
 let timer: ReturnType<typeof setTimeout> | undefined;
 let lastCtx: ExtensionContext | undefined;
@@ -264,6 +305,7 @@ function restartBudget(ctx?: ExtensionContext): void {
 function resetAll(): void {
 	clearTimer();
 	budget = undefined;
+	scope = "session";
 	delete limits.cost;
 	delete limits.time;
 	delete limits.tokens;
@@ -279,6 +321,7 @@ function saveState(): void {
 	if (!persist) return;
 	const state: PersistedState = {
 		limits: { ...limits },
+		scope,
 		budget: budget
 			? {
 					startedAt: budget.startedAt,
@@ -307,7 +350,10 @@ function restoreState(ctx: ExtensionContext): void {
 	} catch {
 		// No session manager available: start disabled.
 	}
-	if (!saved?.limits) return;
+	if (!saved) return;
+	// The scope is remembered even without limits: it applies to the next limit set.
+	if (saved.scope === "prompt") scope = "prompt";
+	if (!saved.limits) return;
 
 	for (const axis of ["cost", "time", "tokens"] as const) {
 		const value = saved.limits[axis];
@@ -333,7 +379,7 @@ function updateStatus(ctx: ExtensionContext | undefined): void {
 
 	if (enabled() && budget) {
 		if (budget.stopped) {
-			text = `session limit: STOPPED (${budget.stopped})`;
+			text = `budget STOPPED (${budget.stopped})${scopeTag()}`;
 		} else {
 			const current = view();
 			const parts: string[] = [];
@@ -342,7 +388,7 @@ function updateStatus(ctx: ExtensionContext | undefined): void {
 			if (current.tokens) {
 				parts.push(`${compactTokens(current.tokens.used)}/${compactTokens(current.tokens.limit)} tok`);
 			}
-			text = parts.join(" · ");
+			text = parts.join(" · ") + scopeTag();
 		}
 	}
 
@@ -374,8 +420,12 @@ function stopIfNeeded(ctx: ExtensionContext | undefined, abort: boolean): boolea
 		budget.stopped = over.map((axis) => AXIS_LABEL[axis]).join(" + ");
 		clearTimer();
 		updateStatus(ctx);
-		const tail = abort ? "Aborting the turn." : "New prompts and tools will be blocked.";
-		notice(ctx, `Session budget exhausted (${budget.stopped}). ${tail}`, "warning");
+		const tail = abort
+			? "Aborting the turn."
+			: scope === "prompt"
+				? "Tools are blocked until the next prompt."
+				: "New prompts and tools will be blocked.";
+		notice(ctx, `The ${scopeNoun()} budget is exhausted (${budget.stopped}). ${tail}`, "warning");
 	}
 
 	if (abort) {
@@ -411,7 +461,7 @@ function releaseIfRecovered(ctx?: ExtensionContext): boolean {
 
 function reminderText(): string {
 	const current = view();
-	const lines: string[] = ["[session-budget] remaining budget for this session:"];
+	const lines: string[] = [`[session-budget] remaining budget for this ${scopeNoun()}:`];
 
 	if (current.cost) {
 		lines.push(
@@ -432,7 +482,7 @@ function reminderText(): string {
 	lines.push("");
 	if (budget?.stopped) {
 		lines.push(
-			`The session budget is exhausted (${budget.stopped}). Do not call any tool. Reply with a short summary of what is done and what is unfinished, and stop.`,
+			`The ${scopeNoun()} budget is exhausted (${budget.stopped}). Do not call any tool. Reply with a short summary of what is done and what is unfinished, and stop.`,
 		);
 	} else {
 		lines.push(
@@ -511,7 +561,8 @@ export function parseAmountForAxis(axis: Axis, raw: string): number | undefined 
 }
 
 function statusReport(): string {
-	const lines: string[] = [enabled() ? "Session limits: ACTIVE" : "Session limits: DISABLED"];
+	const lines: string[] = [enabled() ? "Budget: ACTIVE" : "Budget: DISABLED"];
+	lines.push(`Scope: ${scopeSentence()}.`);
 
 	if (!enabled()) {
 		lines.push("");
@@ -520,6 +571,7 @@ function statusReport(): string {
 		lines.push("  /budget cost 0.50");
 		lines.push("  /budget time 30");
 		lines.push("  /budget tokens 200000");
+		lines.push("  /budget prompt     (or /budget session)");
 		lines.push("  /budget stop");
 		return lines.join("\n");
 	}
@@ -555,6 +607,7 @@ function statusReport(): string {
 	);
 
 	lines.push("");
+	const window = scope === "prompt" ? "this prompt" : "this session";
 	if (!budget) {
 		lines.push("The budget starts counting on the first /budget.");
 	} else {
@@ -562,13 +615,15 @@ function statusReport(): string {
 			hour: "2-digit",
 			minute: "2-digit",
 		});
-		lines.push(
-			budget.stopped
-				? `Session BLOCKED by ${budget.stopped} since ${started}. Raise a limit to unblock.`
-				: `Session budget counting since ${started}.`,
-		);
+		if (budget.stopped) {
+			lines.push(`Counting ${window} since ${started}. BLOCKED by ${budget.stopped}.`);
+			lines.push(scope === "prompt" ? "The block ends with the next prompt." : "Raise a limit to unblock.");
+		} else {
+			lines.push(`Counting ${window} since ${started}.`);
+		}
 	}
 	lines.push("Use /budget reset to zero the usage, or /budget stop to disable it.");
+	if (scope === "session") lines.push("Use /budget prompt to restart the usage on every new prompt.");
 	return lines.join("\n");
 }
 
@@ -579,6 +634,20 @@ function statusReport(): string {
 function matchBudgetCommand(text: string): string | undefined {
 	const match = /^\/budget(?:\s+([\s\S]*))?$/i.exec(text.trim());
 	return match ? (match[1] ?? "").trim() : undefined;
+}
+
+/** Sets the scope. The counter means something different in each scope, so a change starts over. */
+function applyScope(next: Scope, ctx: ExtensionContext): void {
+	const changed = scope !== next;
+	scope = next;
+	if (changed && enabled()) restartBudget(ctx);
+	else updateStatus(ctx);
+
+	const lines = [`Scope: ${scopeSentence()}.`];
+	if (changed && enabled()) lines.push("The usage was restarted at zero.");
+	if (enabled()) lines.push(`Active: ${activeSummary()}.`);
+	else lines.push("No limits set yet, e.g. /budget cost 0.50.");
+	notice(ctx, lines.join("\n"), "info");
 }
 
 async function handleBudgetCommand(args: string, ctx: ExtensionContext): Promise<void> {
@@ -596,7 +665,7 @@ async function handleBudgetCommand(args: string, ctx: ExtensionContext): Promise
 	if (axisRaw === "stop" || axisRaw === "off" || axisRaw === "disable") {
 		resetAll();
 		updateStatus(ctx);
-		notice(ctx, "Session limits disabled. The budget restarts on the next /budget.", "info");
+		notice(ctx, "Budget disabled. Limits, usage and scope were cleared.", "info");
 		return;
 	}
 
@@ -606,12 +675,26 @@ async function handleBudgetCommand(args: string, ctx: ExtensionContext): Promise
 			return;
 		}
 		restartBudget(ctx);
-		notice(ctx, `Session budget restarted (usage reset to zero).\nActive: ${activeSummary()}.`, "info");
+		notice(ctx, `Budget restarted (usage reset to zero).\nScope: ${scopeSentence()}.\nActive: ${activeSummary()}.`, "info");
 		return;
 	}
 
 	if (axisRaw === "help" || axisRaw === "?" || axisRaw === "--help") {
 		notice(ctx, HELP, "info");
+		return;
+	}
+
+	const scopeWord = parseScopeArgument(axisRaw);
+	if (scopeWord) {
+		if (valueRaw) {
+			notice(
+				ctx,
+				`"${axisRaw}" selects the scope and takes no value.\nUse /budget prompt or /budget session, or /budget cost 0.50 to set a limit.`,
+				"error",
+			);
+			return;
+		}
+		applyScope(scopeWord, ctx);
 		return;
 	}
 
@@ -627,7 +710,7 @@ async function handleBudgetCommand(args: string, ctx: ExtensionContext): Promise
 			ctx,
 			current === undefined
 				? `No ${AXIS_LABEL[axis]} limit set. ${AXIS_HINT[axis]}`
-				: `${AXIS_LABEL[axis]} limit: ${formatLimit(axis, current)} per session. ${AXIS_HINT[axis]}`,
+				: `${AXIS_LABEL[axis]} limit: ${formatLimit(axis, current)} per ${scopeNoun()}. ${AXIS_HINT[axis]}`,
 			"info",
 		);
 		return;
@@ -644,7 +727,7 @@ async function handleBudgetCommand(args: string, ctx: ExtensionContext): Promise
 		syncClock(ctx);
 		const released = releaseIfRecovered(ctx);
 		updateStatus(ctx);
-		const suffix = released ? "\nSession budget unblocked." : "";
+		const suffix = released ? "\nBudget unblocked." : "";
 		notice(ctx, `${AXIS_LABEL[axis]} limit removed. Active: ${activeSummary()}.${suffix}`, "info");
 		return;
 	}
@@ -674,13 +757,13 @@ async function handleBudgetCommand(args: string, ctx: ExtensionContext): Promise
 			? "Applied to the running session."
 			: "Effective from now.";
 	const stateNote = released
-		? "\nSession budget unblocked."
+		? "\nBudget unblocked."
 		: blocked
-			? `\nSession still blocked (${budget?.stopped}): usage is already over the limit.`
+			? `\nStill blocked (${budget?.stopped}): the usage is already over the limit.`
 			: "";
 	notice(
 		ctx,
-		`${AXIS_LABEL[axis]} limit set: ${formatLimit(axis, amount)} per session.\nActive: ${activeSummary()}. ${scopeNote}${stateNote}`,
+		`${AXIS_LABEL[axis]} limit set: ${formatLimit(axis, amount)} per ${scopeNoun()}.\nActive: ${activeSummary()}. ${scopeNote}${stateNote}`,
 		"info",
 	);
 }
@@ -699,6 +782,14 @@ export default function sessionLimit(pi: ExtensionAPI) {
 		warnedMissingCost = false;
 		restoreState(ctx);
 		updateStatus(ctx);
+	});
+
+	// Per-prompt scope: every prompt the user starts opens a fresh window. Runs that continue the
+	// same prompt (a retry, a compaction, a queued message) do not fire this hook again.
+	pi.on("before_agent_start", async (event, ctx) => {
+		lastCtx = ctx;
+		if (scope !== "prompt" || !enabled() || event.messageType !== "user") return;
+		restartBudget(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -853,27 +944,33 @@ export default function sessionLimit(pi: ExtensionAPI) {
 
 		if (!budget || !enabled()) return { action: "continue" as const };
 
+		// Per-prompt scope: a prompt typed while idle opens a new window in before_agent_start, so it
+		// is never blocked here. Steering and follow-up messages stay inside the current window.
+		if (scope === "prompt" && event.streamingBehavior === undefined) return { action: "continue" as const };
+
 		if (!budget.stopped) stopIfNeeded(ctx, false);
 		if (!budget.stopped) return { action: "continue" as const };
 
 		notice(
 			ctx,
-			`Session budget exhausted (${budget.stopped}). Raise a limit with /budget or disable it with /budget stop.`,
+			`${scope === "prompt" ? "Prompt" : "Session"} budget exhausted (${budget.stopped}). Raise a limit with /budget or disable it with /budget stop.`,
 			"warning",
 		);
 		return { action: "handled" as const };
 	});
 
 	pi.registerCommand("budget", {
-		description: "Limit session cost, active time and output tokens (off by default)",
+		description: "Limit cost, active time and output tokens, per session or per prompt (off by default)",
 		getArgumentCompletions: (prefix) => {
 			const items = [
-				{ value: "cost ", label: "cost", description: "maximum session cost in US$" },
-				{ value: "time ", label: "time", description: "maximum session active time in minutes" },
-				{ value: "tokens ", label: "tokens", description: "session output tokens" },
-				{ value: "status", label: "status", description: "shows the current limits" },
+				{ value: "cost ", label: "cost", description: "maximum cost in US$" },
+				{ value: "time ", label: "time", description: "maximum active time in minutes" },
+				{ value: "tokens ", label: "tokens", description: "output tokens" },
+				{ value: "prompt", label: "prompt", description: "scope: usage restarts on every new prompt" },
+				{ value: "session", label: "session", description: "scope: usage accumulates over the session" },
+				{ value: "status", label: "status", description: "shows the current state" },
 				{ value: "reset", label: "reset", description: "keeps the limits, zeroes the usage" },
-				{ value: "stop", label: "stop", description: "disables it and clears the usage" },
+				{ value: "stop", label: "stop", description: "disables it, clears usage and scope" },
 			];
 			const query = prefix.trim().toLowerCase();
 			const matches = items.filter((item) => item.label.startsWith(query));
